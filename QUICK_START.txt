@@ -1,196 +1,140 @@
-【VideoToText — 快速入门卡】
-═══════════════════════════════════════════════════════════════════════════
-
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃                       🚀 一句话工作流                                    ┃
-┃                                                                          ┃
-┃  视频文件 → add_video.sh → 自动处理（提取→转录→生成笔记）→ notes/      ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+╔══════════════════════════════════════════════════════════════════════════╗
+║                    VideoToText — 快速入门卡                              ║
+║                                                                          ║
+║   视频文件 → add_video.sh → 提取→转录→生成笔记 → notes/                ║
+╚══════════════════════════════════════════════════════════════════════════╝
 
 
 【第一步】添加视频 📥
 ═══════════════════════════════════════════════════════════════════════════
 
-视频存放位置（唯一入口）：
-  data/input/
+  视频放入位置（唯一入口）：
+    data/input/
 
-推荐方式（自动触发完整流水线）：
-  bash scripts/add_video.sh /path/to/00_14_第十四课：合约升级_01_基础.mp4
+  推荐方式（自动触发完整流水线）：
+    bash scripts/add_video.sh /path/to/00_03_第三课：示例课程丙_01_第一节内容.mp4
 
-或手动方式（放入文件夹后稍后处理）：
-  cp /path/to/video.mp4 data/input/
-  bash scripts/run_pipeline.sh
+  手动方式（放入后稍后执行）：
+    cp /path/to/video.mp4 data/input/
+    bash scripts/run_pipeline.sh
 
 
-【第二步】查看处理进度 🔄
+【第二步】流水线会自动依次执行 🔄
 ═══════════════════════════════════════════════════════════════════════════
 
-处理过程包括 4 个步骤：
-  ✓ 提取音频和关键帧     data/output/{video_name}/audio.mp3, frame_*.jpg
-  ✓ 转录为文本           data/output/{video_name}/transcript/{audio.srt, transcript.md}
-  ✓ 生成 AI 笔记        notes/{course_name}.md
-  ✓ 更新索引            notes/INDEX.md
+  Step 1  提取媒体     →  data/output/{视频名}/audio.mp3 + frame_*.jpg
+  Step 2  转录音频     →  data/output/{视频名}/transcript/audio.srt
+                          data/srt_exports/{课程名}/{段落名}.srt   ← 聚合
+  Step 3  生成笔记     →  notes/{课程名}.md（同课程多段自动合并）
+  Step 4  更新索引     →  notes/INDEX.md
 
 
-【第三步】查看最终笔记 📚
+【第三步】查看结果 📚
 ═══════════════════════════════════════════════════════════════════════════
 
-笔记位置：
-  notes/00_XX_课程名.md
+  课程笔记：
+    notes/00_XX_课程名.md
 
-索引页面（一站式导航）：
-  notes/INDEX.md  ← 所有课程、转录统计、关键帧数
+  全局索引（一站式导航）：
+    notes/INDEX.md
 
+  Obsidian 看板（Dataview 动态视图）：
+    notes/000_我的视频知识大盘.md
 
-【关键路径】
-═══════════════════════════════════════════════════════════════════════════
-
-┌────────────────────────────┐
-│   data/input/              │  ← 新视频放这里
-│   ├─ 00_14_..._01.mp4     │
-│   └─ 00_14_..._02.mp4     │
-└────────────┬───────────────┘
-             │
-             ↓
-        add_video.sh  or  run_pipeline.sh
-             │
-   ┌─────────┼─────────┐
-   ↓         ↓         ↓
-Extract   Transcribe  Generate
-  Media     Audio       Notes
-   ↓         ↓         ↓
-   └─────────┼─────────┘
-             ↓
-┌────────────────────────────┐
-│   data/output/             │  ← 临时产物
-│   ├─ 00_14_..._01/        │
-│   │  ├─ audio.mp3         │
-│   │  ├─ frame_*.jpg       │
-│   │  └─ transcript/       │
-│   │     ├─ audio.srt      │
-│   │     └─ transcript.md  │
-│   └─ 00_14_..._02/        │
-└────────────┬───────────────┘
-             │
-             ↓
-┌────────────────────────────┐
-│   notes/                   │  ← 最终输出
-│   ├─ 00_14_课程名.md      │
-│   └─ INDEX.md             │
-└────────────────────────────┘
-
-
-【常用命令】
-═══════════════════════════════════════════════════════════════════════════
-
-# 添加单个视频并自动处理（推荐）
-bash scripts/add_video.sh /path/to/video.mp4
-
-# 一键执行完整流水线
-bash scripts/run_pipeline.sh
-
-# 仅生成/重建笔记（已有转录文本时）
-.venv/bin/python src/generate_note.py --all
-
-# 强制重新生成所有笔记
-bash scripts/run_pipeline.sh --force-note
-
-# 查看当前处理队列（data/input 中的视频）
-ls data/input/
-
-# 查看已生成的笔记（data/output 中的转录）
-ls data/output/
-
-# 查看最终笔记
-ls notes/
-
-
-【高级用法】
-═══════════════════════════════════════════════════════════════════════════
-
-# 强制重新转录所有（包括已完成）
-TRANSCRIBE_FORCE=true bash scripts/run_pipeline.sh
-
-# 跳过提取，仅转录和生成笔记
-bash scripts/run_pipeline.sh --skip-extract
-
-# 仅处理笔记生成和索引更新（已有转录时）
-bash scripts/run_pipeline.sh --note-only
-
-# 为指定课程生成笔记
-.venv/bin/python src/generate_note.py --prefix "00_14_第十四课：合约升级"
-
-# 查看帮助和完整说明
-bash scripts/add_video.sh --help
-cat WORKFLOW.md
-cat PROJECT_MAP.txt
+  在 Cursor 中引用整课转录：
+    @data/srt_exports/00_03_第三课：示例课程丙/
 
 
 【命名规范】
 ═══════════════════════════════════════════════════════════════════════════
 
-视频文件名格式决定最终笔记名。建议：
-  {课程编号}_{课程主题}_{段编号}_{段标题}.mp4
+  格式：{课程编号}_{课程名}_{段编号}_{段标题}.mp4
 
-例如：
-  ✅ 00_14_第十四课：合约升级_01_代理模式基础.mp4
-  ✅ 00_14_第十四课：合约升级_02_透明代理与 UUPS 实现.mp4
-  → 生成单一笔记：notes/00_14_第十四课：合约升级.md
+  ✅ 00_03_第三课：示例课程丙_01_第一节内容.mp4
+  ✅ 00_03_第三课：示例课程丙_02_第二节内容.mp4
+     → 生成笔记：notes/00_03_第三课：示例课程丙.md
 
-  ❌ 视频.mp4           （不可识别）
-  ❌ lesson14_v3.mp4    （无课程编号）
+  ❌ 视频.mp4            （无法识别）
+  ❌ lesson03_v3.mp4     （无课程编号格式）
 
 
-【关键特性】
+【常用命令】
 ═══════════════════════════════════════════════════════════════════════════
 
-✅ 增量处理 — 已完成的步骤自动跳过，加速后续运行
-   (使用 --force 可覆盖)
+  # 添加视频并自动处理（推荐）
+  bash scripts/add_video.sh /path/to/video.mp4
 
-✅ 自动分片 — 超过 18MB 的音频自动分片转录
-   (5分钟/片，自动处理失败和超时)
+  # 一键执行完整流水线
+  bash scripts/run_pipeline.sh
 
-✅ 课程自动合并 — 同前缀的多视频段自动合并为一份笔记
+  # 强制重新生成所有笔记
+  bash scripts/run_pipeline.sh --force-note
 
-✅ INDEX 自动维护 — 每次生成后自动更新 notes/INDEX.md
-   (包含课程名、链接、段数、时长、转录行数、关键帧数)
+  # 仅生成笔记（已有转录时）
+  .venv/bin/python src/generate_note.py --all
+
+  # 为指定课程生成笔记
+  .venv/bin/python src/generate_note.py --prefix "00_03_第三课：示例课程丙"
+
+  # 仅重建 INDEX.md
+  .venv/bin/python src/generate_note.py --update-index
+
+  # 强制重新转录所有
+  TRANSCRIBE_FORCE=true .venv/bin/python src/transcribe_audio.py
+
+
+【数据流向】
+═══════════════════════════════════════════════════════════════════════════
+
+┌───────────────────────────┐
+│   data/input/             │  ← 新视频放这里
+│   ├─ 00_03_..._01.mp4    │
+│   └─ 00_03_..._02.mp4    │
+└──────────────┬────────────┘
+               ↓  extract_media.py
+┌───────────────────────────┐
+│   data/output/            │  ← 提取 + 转录产物
+│   ├─ 00_03_..._01/       │
+│   │  ├─ audio.mp3        │
+│   │  ├─ frame_*.jpg      │
+│   │  └─ transcript/      │
+│   │     └─ audio.srt     │
+│   └─ 00_03_..._02/       │
+└──────┬───────────┬────────┘
+       ↓           ↓
+  transcribe    聚合 SRT
+  _audio.py        ↓
+            data/srt_exports/
+            └─ 00_03_.../
+               └─ 01_....srt
+               └─ 02_....srt
+                   ↓  generate_note.py
+              ┌───────────────────────────┐
+              │   notes/                  │  ← 最终笔记
+              │   ├─ 00_03_课程名.md     │
+              │   └─ INDEX.md            │
+              └───────────────────────────┘
 
 
 【文件结构简览】
 ═══════════════════════════════════════════════════════════════════════════
 
-📦 VideoToText/
-│
-├─ 📥 data/input/                    新视频放这里
-│
-├─ 🔄 data/output/                   处理产物
-│  └─ {video_name}/
-│     ├─ audio.mp3
-│     ├─ frame_*.jpg
-│     └─ transcript/
-│        ├─ audio.srt
-│        └─ transcript.md
-│
-├─ 📚 notes/                         最终笔记
-│  ├─ 00_12_第十二课：离线签名与应用.md
-│  ├─ 00_13_第十三课：事件索引.md
-│  └─ INDEX.md
-│
-├─ 🔧 src/                           核心脚本
-│  ├─ extract_media.py
-│  ├─ transcribe_audio.py
-│  └─ generate_note.py
-│
-├─ 🚀 scripts/                       入口脚本
-│  ├─ add_video.sh           ⭐ 添加视频
-│  ├─ run_pipeline.sh        ⭐ 流水线
-│  └─ transcribe_test.sh
-│
-└─ 📄 文档
-   ├─ README.md
-   ├─ WORKFLOW.md            ⭐ 完整说明
-   └─ PROJECT_MAP.txt        ⭐ 这份卡
+  📥 data/input/          新视频放这里
+  🔄 data/output/         提取产物（音频、关键帧、转录）
+  📦 data/srt_exports/    SRT 按课程聚合（Cursor 引用用）
+  📚 notes/               最终笔记（Obsidian 知识库）
+  🔧 src/                 核心脚本
+  🚀 scripts/             入口脚本
 
+
+【完整文档】
 ═══════════════════════════════════════════════════════════════════════════
-快速查询：cat QUICK_START.txt
-═══════════════════════════════════════════════════════════════════════════
+
+  快速入门   →  QUICK_START.txt      （本文件）
+  完整说明   →  WORKFLOW.md
+  项目地图   →  PROJECT_MAP.txt
+  项目简介   →  README.md
+
+╔══════════════════════════════════════════════════════════════════════════╗
+║  快速查询：cat QUICK_START.txt                                           ║
+╚══════════════════════════════════════════════════════════════════════════╝
