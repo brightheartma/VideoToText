@@ -1,201 +1,245 @@
 """
 generate_note.py
 ----------------
-调用 Groq chat API，根据转录文本和关键帧信息生成 NotebookLM 风格笔记。
-生成完成后自动更新 notes/INDEX.md。
+按课程前缀聚合分段转录，调用 LLM 生成：
+1) 思维导图（Markdown 列表 → markmap 代码块）
+2) 综合数据表格
+3) 各段详情
 
-策略：同一课程前缀的多个视频段 → 逐段调用 LLM（控制 token）→ 合并写入一个课程笔记文件。
-
-用法：
-    # 为某一前缀的课程生成笔记（自动合并同一前缀的多个视频段）
-    .venv/bin/python src/generate_note.py --prefix "00_13_第十三课：事件索引"
-
-    # 为所有尚未生成笔记的课程批量生成
-    .venv/bin/python src/generate_note.py --all
-
-    # 强制重新生成（覆盖已有笔记）
-    .venv/bin/python src/generate_note.py --prefix "00_13_第十三课：事件索引" --force
-
-环境变量：
-    GROQ_API_KEY       Groq API 密钥（必需）
-    NOTE_MODEL         使用的模型（默认 llama-3.3-70b-versatile）
-    NOTE_MAX_TOKENS    最大输出 token（默认 4096）
-    NOTE_SRT_CHARS     每段 SRT 最大字符数（默认 6000，约 2000 token）
+最终输出为 notes/{prefix}.md，并自动重建 notes/INDEX.md。
 """
 
+import argparse
+import datetime
 import os
 import re
 import sys
 import time
-import datetime
-import argparse
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from groq import Groq
 
 # ─── 路径配置 ─────────────────────────────────────────────────────────────────
-BASE_DIR     = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUT_MEDIA = BASE_DIR / "data" / "output"
-NOTES_DIR    = BASE_DIR / "notes"
-PROMPTS_DIR  = BASE_DIR / "prompts"
-PROMPT_FILE  = PROMPTS_DIR / "notebooklm_prompt.md"
-INDEX_FILE   = NOTES_DIR / "INDEX.md"
+NOTES_DIR = BASE_DIR / "notes"
+PROMPTS_DIR = BASE_DIR / "prompts"
+PROMPT_FILE = PROMPTS_DIR / "notebooklm_prompt.md"
+INDEX_FILE = NOTES_DIR / "INDEX.md"
 
 # ─── 模型配置 ─────────────────────────────────────────────────────────────────
-NOTE_MODEL      = os.getenv("NOTE_MODEL", "llama-3.1-8b-instant")
-NOTE_MAX_TOKENS = int(os.getenv("NOTE_MAX_TOKENS", "2048"))
-# 每段送入 LLM 的 SRT 文本最大字符数（约 1500 token）
-NOTE_SRT_CHARS  = int(os.getenv("NOTE_SRT_CHARS", "4000"))
-# 段间休眠秒数（避免连续调用撞 TPM 限制）
+NOTE_MODEL = os.getenv("NOTE_MODEL", "llama-3.3-70b-versatile")
+NOTE_MAX_TOKENS = int(os.getenv("NOTE_MAX_TOKENS", "4096"))
+NOTE_SRT_CHARS = int(os.getenv("NOTE_SRT_CHARS", "4000"))
 NOTE_SEGMENT_SLEEP = int(os.getenv("NOTE_SEGMENT_SLEEP", "10"))
 
-# ─── 工具函数 ─────────────────────────────────────────────────────────────────
+# ─── 预编译正则 ───────────────────────────────────────────────────────────────
+_RE_SRT_TS = re.compile(r"(\d{2}:\d{2}:\d{2}),\d{3}\s*-->")
+_RE_DURATION = re.compile(r"(\d+):(\d+):(\d+)")
+_RE_PREFIX_SEG = re.compile(r"_\d{2}_")
+_RE_BLOCK_PARSE = re.compile(
+    r"(?:<<<|===)MINDMAP(?:>>+|===)\s*(.*?)\s*"
+    r"(?:<<<|===)DATATABLE(?:>>+|===)\s*(.*?)\s*"
+    r"(?:<<<|===)DETAIL(?:>>+|===)\s*(.*?)\s*"
+    r"(?:(?:<<<|===)END(?:>>+|===)|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+_RE_HEADING = re.compile(r"^(#+)\s*(.*)$")
+_RE_TABLE_SEP = re.compile(r"^\|\s*:?-{2,}")
+_RE_LEAKED_SECTION = re.compile(r"^#{1,2}\s*[0-2]\.")
+_RE_MARKDOWN_WRAP = re.compile(r"^```\s*markdown\s*$", re.IGNORECASE)
+_RE_BACKTICK_LINE = re.compile(r"^```\s*$")
+_RE_INDENT_BACKTICK = re.compile(r"^[ \t]+```", re.MULTILINE)
+_BLOCK_KEYWORDS = frozenset(("MINDMAP", "DATATABLE", "DETAIL", "END"))
+_NOISE_PREFIXES = ("<<<", "===", "|", "```", ">")
+_LEAKED_PHRASES = ("素材与覆盖范围", "结构化思维导图", "综合数据表格")
+_RATE_LIMIT_KEYS = ("429", "rate limit", "too many requests", "tokens per minute")
 
-def _srt_line_count(srt_path: Path) -> int:
+
+# ─── Whisper 误识别词典（在喂给 LLM 之前预处理，不影响 Prompt 逻辑）────────────
+# 格式：(错误识别词, 正确词)，按长度降序排列避免短词误匹配
+_WHISPER_CORRECTIONS: List[Tuple[str, str]] = [
+    # 品牌 / 项目名
+    ("分Jablin",     "OpenZeppelin"),
+    ("分zippelin",   "OpenZeppelin"),
+    ("分ziplin",     "OpenZeppelin"),
+    ("分泽平",       "OpenZeppelin"),
+    ("open ziplin",  "OpenZeppelin"),
+    ("索利体",       "Solidity"),
+    ("ipni",         "IPFS"),
+    ("Essiline",     "eth_signTypedData"),
+    ("以太坊登诺",   "eth_signTypedData"),
+    ("Lemix",        "Remix"),
+    ("Premiere2",    "Permit2"),
+    # 密码学 / 区块链术语
+    ("非对签加密",   "非对称加密"),
+    ("公要",         "公钥"),
+    ("私要",         "私钥"),
+    ("团曲线",       "椭圆曲线"),
+    ("十六精致",     "十六进制"),
+    ("十六精制",     "十六进制"),
+    ("推荡",         "推导"),
+    ("教验",         "校验"),
+    ("弹码",         "代码"),
+    ("自征",         "自增"),
+    # ERC 标准
+    ("earc721",      "ERC-721"),
+    ("earc20",       "ERC-20"),
+    ("earc",         "ERC"),
+    ("mft",          "NFT"),
+]
+
+def _apply_whisper_corrections(text: str) -> str:
+    """将 Whisper 已知误识别词替换为正确词，在喂给 LLM 前调用。"""
+    for wrong, correct in _WHISPER_CORRECTIONS:
+        text = text.replace(wrong, correct)
+    return text
+
+
+# ─── SRT 一次性读取 ──────────────────────────────────────────────────────────
+def _read_srt_meta(srt_path: Path) -> Tuple[str, int, str]:
+    """一次读取 SRT 文件，返回 (全文, 行数, 末尾时间戳)。"""
     try:
-        return sum(1 for _ in srt_path.open(encoding="utf-8"))
+        text = srt_path.read_text(encoding="utf-8")
+    except OSError:
+        return "", 0, "未知"
+
+    lines = text.splitlines()
+    line_count = len(lines)
+
+    duration = "未知"
+    for line in reversed(lines):
+        m = _RE_SRT_TS.search(line)
+        if m:
+            duration = m.group(1)
+            break
+
+    text = _apply_whisper_corrections(text)
+    return text, line_count, duration
+
+
+def _truncate_srt(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = int(max_chars * 0.45)
+    tail = max_chars - head
+    return (
+        text[:head]
+        + "\n\n[... 中间内容已截断，保留头尾关键上下文 ...]\n\n"
+        + text[-tail:]
+    )
+
+
+def _frame_count(folder: Path) -> int:
+    """统计关键帧数（仅匹配文件名，不读文件内容）。"""
+    try:
+        return sum(1 for f in folder.iterdir() if f.suffix == ".jpg" and f.name.startswith("frame_"))
     except OSError:
         return 0
 
 
-def _srt_duration(srt_path: Path) -> str:
-    """从 SRT 文件末尾读取最后一个时间戳"""
-    try:
-        lines = srt_path.read_text(encoding="utf-8").splitlines()
-        for line in reversed(lines):
-            m = re.search(r"(\d{2}:\d{2}:\d{2}),\d{3}\s*-->", line)
-            if m:
-                return m.group(1)
-    except OSError:
-        pass
-    return "未知"
-
-
-def _frame_count(folder: Path) -> int:
-    return sum(1 for _ in folder.glob("frame_*.jpg"))
-
-
-def _read_srt(srt_path: Path, max_chars: int) -> str:
-    """读取 SRT，超长时取头 40% + 尾 60%（保留开头脉络和结尾结论）"""
-    try:
-        text = srt_path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    head = int(max_chars * 0.4)
-    tail = max_chars - head
-    return text[:head] + "\n\n[... 中间内容已截断，仅保留头尾 ...]\n\n" + text[-tail:]
-
-
+# ─── 前缀与段落扫描（全局缓存）──────────────────────────────────────────────
 def get_note_prefix(folder_name: str) -> str:
-    """从文件夹名提取课程前缀，以最后一个 _NN_ 作为段号分隔符
-
-    例：
-    "00_12_第十二课：离线签名与应用_01_课前讨论" → "00_12_第十二课：离线签名与应用"
-    "00_14_第十四课：深入合约创建_02_QA..."     → "00_14_第十四课：深入合约创建"
-
-    关键：取最后一个 _\d{2}_ 的位置，避免课程编号里的数字（如 _12_）被误判。
-    """
-    matches = list(re.finditer(r"_\d{2}_", folder_name))
-    if len(matches) >= 2:
-        # 最后一个 _NN_ 是段号，取其前缀
-        return folder_name[:matches[-1].start()]
-    if len(matches) == 1:
-        return folder_name[:matches[0].start()]
-    return folder_name
+    matches = list(_RE_PREFIX_SEG.finditer(folder_name))
+    return folder_name[: matches[-1].start()] if matches else folder_name
 
 
-def collect_segments(prefix: str) -> List[Dict]:
-    """收集同一课程前缀下所有已转录的视频段元数据，按名称排序"""
-    segments = []
-    for folder in sorted(OUTPUT_MEDIA.iterdir()):
-        if not folder.is_dir():
-            continue
-        if not folder.name.startswith(prefix + "_"):
-            continue
-        srt   = folder / "transcript" / "audio.srt"
-        md    = folder / "transcript" / "transcript.md"
-        audio = folder / "audio.mp3"
-        if not srt.exists():
-            continue
-        segments.append({
-            "folder":      folder.name,
-            "path":        folder,
-            "srt":         srt,
-            "md":          md,
-            "audio":       audio,
-            "srt_lines":   _srt_line_count(srt),
-            "duration":    _srt_duration(srt),
-            "frame_count": _frame_count(folder),
-            "audio_mb":    round(audio.stat().st_size / 1024 / 1024, 1) if audio.exists() else 0,
-        })
-    return segments
+def _scan_all_segments() -> Dict[str, List[Dict]]:
+    """一次扫描 data/output，按课程前缀分组返回所有段落元数据。"""
+    grouped: Dict[str, List[Dict]] = {}
+    if not OUTPUT_MEDIA.exists():
+        return grouped
 
-
-def discover_all_prefixes() -> List[str]:
-    """从 data/output/ 中发现所有已转录的课程前缀"""
-    prefixes: set = set()
     for folder in OUTPUT_MEDIA.iterdir():
         if not folder.is_dir():
             continue
-        if (folder / "transcript" / "audio.srt").exists():
-            prefixes.add(get_note_prefix(folder.name))
-    return sorted(prefixes)
+        srt_path = folder / "transcript" / "audio.srt"
+        if not srt_path.exists():
+            continue
+
+        srt_text, srt_lines, duration = _read_srt_meta(srt_path)
+        prefix = get_note_prefix(folder.name)
+        seg = {
+            "folder": folder.name,
+            "path": folder,
+            "srt": srt_path,
+            "srt_text": srt_text,
+            "duration": duration,
+            "srt_lines": srt_lines,
+            "frame_count": _frame_count(folder),
+        }
+        grouped.setdefault(prefix, []).append(seg)
+
+    for segs in grouped.values():
+        segs.sort(key=lambda x: x["folder"])
+    return grouped
 
 
-# ─── LLM 调用 ─────────────────────────────────────────────────────────────────
+_segment_cache: Optional[Dict[str, List[Dict]]] = None
 
-def _build_segment_prompt(seg: Dict, prompt_text: str, seg_idx: int, total: int) -> str:
-    """为单个视频段构建 prompt，要求输出三个结构化标记块供后续合并"""
-    srt_content = _read_srt(seg["srt"], NOTE_SRT_CHARS)
+
+def _get_segment_cache() -> Dict[str, List[Dict]]:
+    global _segment_cache
+    if _segment_cache is None:
+        _segment_cache = _scan_all_segments()
+    return _segment_cache
+
+
+def collect_segments(prefix: str) -> List[Dict]:
+    return list(_get_segment_cache().get(prefix, []))
+
+
+def discover_prefixes() -> List[str]:
+    return sorted(_get_segment_cache().keys())
+
+
+# ─── LLM 提示构建 ──────────────────────────────────────────────────────────────
+def _build_segment_prompt(seg: Dict, seg_idx: int, total: int) -> str:
+    srt_content = _truncate_srt(seg.get("srt_text", ""), NOTE_SRT_CHARS)
     seg_name = seg["folder"]
+    seg_short = seg_name.split("_", 3)[-1] if "_" in seg_name else seg_name
+
     return "\n".join([
-        prompt_text,
+        "你是一个高信噪比的视频课程内容分析师。",
+        "【最高优先级规则——反幻觉】",
+        "1. 所有内容必须 100% 来自下方转录文本，禁止添加转录中不存在的信息。",
+        "2. 绝对禁止编造代码！如果转录中没有逐行念出代码，就不要输出任何代码块。",
+        "3. 只有当讲师在转录中逐行念出了完整代码时，才可以用代码块还原。",
+        "4. 禁止复读本提示词中的任何指令文本。",
         "",
-        "=" * 60,
-        f"# 待分析视频段 [{seg_idx}/{total}]",
-        f"- 视频段名称：{seg_name}",
-        f"- 时长：{seg['duration']}",
-        f"- 转录行数：{seg['srt_lines']} 行",
-        "=" * 60,
+        f"视频段：{seg_name}（第 {seg_idx}/{total} 段，时长 {seg['duration']}，{seg['srt_lines']} 行转录）",
         "",
-        "## 转录内容（SRT）：",
+        "--- 转录内容 ---",
         srt_content,
+        "--- 输出要求（三个区块，标记符独占一行）---",
         "",
-        "=" * 60,
-        "## 输出格式要求（必须严格遵守）",
+        "<<<MINDMAP>>>",
+        "用 Markdown 无序列表（-）输出本段知识点层级。",
+        "【警告】绝对禁止使用 `#` 标题语法！只能通过前面加 2 个或 4 个空格来体现层级！",
+        "每个节点尾部附 [HH:MM:SS]。",
         "",
-        "请将输出分为以下三个标记块，每块之间用分隔符隔开：",
+        "<<<DATATABLE>>>",
+        "仅输出真实数据行（| 开头 | 结尾），禁止表头、分割线、占位符。",
+        f"列顺序：| {seg_short} | HH:MM:SS | 主题 | 关键术语 | 证据来源 | 可执行结论 |",
+        "时间戳必须是 HH:MM:SS 格式（禁止带毫秒，禁止带箭头）。",
+        "【警告】绝对禁止改变列数！每行必须有且仅有 7 个管道符 `|`！",
         "",
-        "===MINDMAP===",
-        "（此处输出本视频段的思维导图内容，使用 Markdown 标题层级格式（## 和 ### 和 ####），",
-        "不要使用列表符号（-）。层次：## 核心主题 → ### 子概念 → #### 关键论据/例子。",
-        "每个节点必须附带精确时间戳，格式如 `[00:05:30]`，写在标题文字之后同一行。",
-        "示例：",
-        "## EIP-712 结构化签名 [00:12:00]",
-        "### 解决问题：可读性差的 bytes 签名",
-        "### 实现：TypedData + domain separator [00:15:30]",
-        "#### 关键字段：chainId, verifyingContract）",
+        "<<<DETAIL>>>",
+        f"输出本段（{seg_short}）的详细解析，严格 3 个项目符号：",
+        "- **核心大纲**：2-3 句概述核心目标与讨论焦点。",
+        "- **关键数据与术语**：提取转录中出现的专业名词并简短解释。",
+        "- **详细解析**：基于转录复盘论述逻辑，用纯文本描述。",
+        "【警告】如果没有代码，直接输出纯文本！绝对禁止输出类似 ```solidity 无代码 ``` 这种包含中文的假代码块！",
         "",
-        "===DATATABLE===",
-        "（此处输出本视频段的数据表格行，不含表头。",
-        f"每行格式：| {seg_name} | 时间戳 | 主题/章节 | 关键术语/数据/对比 | 证据（转录行/关键帧） | 可执行结论 |",
-        "每个知识点输出一行，至少 3 行。）",
-        "",
-        "===DETAIL===",
-        "（此处输出本视频段的补充说明，包含：重要代码片段、核心概念解释、学习建议。）",
-        "",
-        "===END===",
-        "",
-        "注意：必须输出全部三个标记块，标记符本身单独占一行，不要省略或修改标记符。",
+        "<<<END>>>",
     ])
 
 
-def call_llm(client: Groq, prompt: str, retry: int = 3) -> str:
-    """调用 LLM，支持 TPM 限制时自动等待重试"""
+# ─── LLM 调用 ─────────────────────────────────────────────────────────────────
+def call_llm(client: Groq, prompt: str, retry: int = 6) -> str:
     for attempt in range(retry):
         try:
             resp = client.chat.completions.create(
@@ -206,145 +250,312 @@ def call_llm(client: Groq, prompt: str, retry: int = 3) -> str:
                         "role": "system",
                         "content": (
                             "你是一位专业的视频课程内容分析师，擅长将视频转录整理成"
-                            "结构清晰、带时间戳的 NotebookLM 风格 Markdown 笔记。"
-                            "直接输出 Markdown，从标题开始，不含解释性前言。"
+                            "结构清晰、带时间戳的 Markdown 笔记。直接输出内容，不要解释。"
                         ),
                     },
                     {"role": "user", "content": prompt},
                 ],
             )
-            return resp.choices[0].message.content.strip()
+            return (resp.choices[0].message.content or "").strip()
         except Exception as e:
-            err_str = str(e)
-            # TPM 限流：等待 65 秒（每分钟重置）后重试
-            if "rate_limit_exceeded" in err_str or "tokens per minute" in err_str.lower():
+            err_str = str(e).lower()
+            if any(k in err_str for k in _RATE_LIMIT_KEYS):
                 wait = 65
-                print(f"   ⏳ 触发 TPM 限流，等待 {wait}s 后重试（{attempt+1}/{retry}）...", flush=True)
+                print(f"   ⏳ 触发 API 限流，休眠 {wait}s 后重试（{attempt+1}/{retry}）...", flush=True)
                 time.sleep(wait)
                 continue
-            # 413 token 超大：缩短 SRT 采样后重试
             if "413" in err_str and attempt < retry - 1:
-                print(f"   ⚠️  413 Token 超大，缩减内容后重试（{attempt+1}/{retry}）...", flush=True)
-                # 在 prompt 中裁切 SRT 内容
-                prompt = re.sub(
-                    r"(\[... 中间内容已截断.*?\])",
-                    "[... 大量内容已省略 ...]",
-                    prompt
-                )
-                # 将 NOTE_SRT_CHARS 减半效果：直接截断 prompt
-                half = len(prompt) // 2
-                prompt = prompt[:half] + "\n\n[... 内容已缩减 ...]\n\n请根据以上内容生成笔记章节。"
+                print(f"   ⚠️  内容超大 (413)，缩减 prompt 后重试（{attempt+1}/{retry}）...", flush=True)
+                prompt = prompt[: len(prompt) // 2] + "\n\n[... 内容已缩减 ...]\n<<<END>>>"
+                time.sleep(5)
                 continue
+            print(f"   ❌ LLM 请求失败: {e}", flush=True)
             raise
-    raise RuntimeError(f"LLM 调用失败，已重试 {retry} 次")
+    raise RuntimeError(f"LLM 调用失败，已耗尽 {retry} 次重试")
 
 
-# ─── 核心生成函数 ─────────────────────────────────────────────────────────────
-
+# ─── 区块解析与清洗 ────────────────────────────────────────────────────────────
 def _parse_blocks(raw: str) -> Dict[str, str]:
-    """从 LLM 输出中解析 ===MINDMAP=== / ===DATATABLE=== / ===DETAIL=== 三个标记块"""
-    blocks = {"mindmap": "", "datatable": "", "detail": raw}
-    pattern = re.compile(
-        r"===MINDMAP===\s*(.*?)\s*===DATATABLE===\s*(.*?)\s*===DETAIL===\s*(.*?)\s*(?:===END===|$)",
-        re.DOTALL | re.IGNORECASE,
-    )
-    m = pattern.search(raw)
-    if m:
-        blocks["mindmap"]   = m.group(1).strip()
-        blocks["datatable"] = m.group(2).strip()
-        blocks["detail"]    = m.group(3).strip()
+    blocks: Dict[str, str] = {"mindmap": "", "datatable": "", "detail": raw}
+    m = _RE_BLOCK_PARSE.search(raw)
+    if not m:
+        # 解析失败时仍需清洗，防止 <<<MINDMAP>> 等标记泄漏到笔记
+        blocks["detail"] = _clean_detail(raw)
+        return blocks
+    blocks["mindmap"] = _clean_mindmap(m.group(1))
+    blocks["datatable"] = _clean_datatable(m.group(2))
+    blocks["detail"] = _clean_detail(m.group(3))
     return blocks
 
 
+_MINDMAP_NOISE = (
+    "用 markdown", "用 Markdown", "无序列表", "思维导图",
+    "输出本段", "层次用缩进", "禁止输出",
+)
+
+def _clean_mindmap(text: str) -> str:
+    lines: List[str] = []
+    for line in text.splitlines():
+        s = line.rstrip()
+        stripped = s.lstrip()
+        if not stripped or stripped.startswith(_NOISE_PREFIXES):
+            continue
+        if any(k in stripped.upper() for k in _BLOCK_KEYWORDS):
+            continue
+        # 过滤 LLM 复读的 prompt 指令文本
+        if any(noise in stripped for noise in _MINDMAP_NOISE):
+            continue
+        if stripped.startswith("- "):
+            lines.append(s)
+        elif stripped.startswith("#"):
+            m = _RE_HEADING.match(stripped)
+            if m:
+                indent = "  " * max(0, len(m.group(1)) - 2)
+                lines.append(f"{indent}- {m.group(2).strip()}")
+    return "\n".join(lines).strip()
+
+
+_DATATABLE_PLACEHOLDERS = ("视频段", "时间戳", "HH:MM:SS", "主题/章节", "关键术语/对比", "证据来源")
+_RE_SRT_ARROW = re.compile(r"\d{2}:\d{2}:\d{2}[,:]\d{3}\s*-->")
+
+_RE_TIMESTAMP_MS = re.compile(r"(\d{2}:\d{2}:\d{2})[,:.]\d{3}")
+_EXPECTED_PIPE_COUNT = 7
+
+def _clean_datatable(text: str) -> str:
+    rows: List[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or not s.startswith("|"):
+            continue
+        if any(kw in s for kw in _DATATABLE_PLACEHOLDERS):
+            continue
+        if _RE_TABLE_SEP.match(s):
+            continue
+
+        # 剔除时间戳毫秒 (00:00:12,040 -> 00:00:12)
+        s = _RE_TIMESTAMP_MS.sub(r"\1", s)
+
+        # 清除 SRT 箭头
+        if _RE_SRT_ARROW.search(s):
+            s = _RE_SRT_ARROW.sub("", s)
+
+        if not s.endswith("|"):
+            s += " |"
+
+        # 过滤幽灵行
+        if len(s.replace("|", "").strip()) < 5:
+            continue
+
+        # 强制列数校验：必须恰好 7 个管道符（6 列数据）
+        if s.count("|") != _EXPECTED_PIPE_COUNT:
+            continue
+
+        rows.append(s)
+    return "\n".join(rows).strip()
+
+
+def _list_to_markmap(lines: List[str], root_title: str) -> str:
+    out = [f"# {root_title}"]
+    for line in lines:
+        s = line.rstrip()
+        stripped = s.lstrip()
+        if not stripped or not stripped.startswith("- "):
+            continue
+        depth = (len(s) - len(stripped)) // 2
+        body = stripped[2:].strip()
+        if body.startswith("**") and body.endswith("**"):
+            body = body[2:-2]
+        out.append("#" * min(depth + 2, 6) + " " + body)
+    return "\n".join(out)
+
+
+_RE_FAKE_CODE_LINE = re.compile(
+    r"^```[a-zA-Z]*[^\n`]*[\u4e00-\u9fa5]+[^\n`]*```\s*$", re.MULTILINE
+)
+
+def _clean_detail(text: str) -> str:
+    # 一击必杀：同一行内反引号夹杂中文的假代码块（如 ```solidity 无可执行代码块 ```）
+    text = _RE_FAKE_CODE_LINE.sub("", text)
+
+    lines = text.splitlines()
+    if lines and _RE_MARKDOWN_WRAP.match(lines[0]):
+        lines = lines[1:]
+        for i in range(len(lines) - 1, -1, -1):
+            if _RE_BACKTICK_LINE.match(lines[i].strip()):
+                lines = lines[:i]
+                break
+        text = "\n".join(lines)
+
+    text = _RE_INDENT_BACKTICK.sub("```", text)
+
+    out: List[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            out.append(line)
+            continue
+        if s.startswith(("<<<", "===")):
+            continue
+        if _RE_LEAKED_SECTION.match(s):
+            continue
+        if any(p in s for p in _LEAKED_PHRASES):
+            continue
+        out.append(line)
+
+    result: List[str] = []
+    for line in out:
+        spaces = len(line) - len(line.lstrip())
+        if spaces >= 4:
+            stripped = line.lstrip()
+            if stripped.startswith("```") or not re.match(r"^[-*#|>\d.]", stripped):
+                result.append(stripped)
+            else:
+                result.append(line)
+        else:
+            result.append(line)
+
+    result = _strip_fabricated_code_blocks(result)
+
+    cleaned = "\n".join(result).strip()
+    if not cleaned:
+        cleaned = (
+            "- **核心大纲**：本段内容可读信息较少，建议结合关键帧复核。\n"
+            "- **关键数据与术语**：待转录验证。\n"
+            "- **详细解析**：未提取到稳定结构化描述。"
+        )
+    return cleaned
+
+
+_RE_CODE_FENCE_OPEN = re.compile(r"^```\w*")
+_FABRICATION_SIGNALS = (
+    "// ...", "// 例子", "// 示例", "// 使用", "// 加密", "// 解密",
+    "// 验证", "// 美化", "// 口语", "// 变通", "// 实现", "// 这个",
+    "// 非相关", "var 美化", "var 变通", "var 实现", "var 提升",
+    "var 口语", "var 提高",
+)
+
+def _strip_fabricated_code_blocks(lines: List[str]) -> List[str]:
+    """检测并移除 LLM 编造的代码块。
+    判定标准：代码块内有效代码行（非注释、非空、非大括号）少于 2 行，
+    或包含明显的编造信号词。
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _RE_CODE_FENCE_OPEN.match(line.strip()):
+            block_lines = [line]
+            i += 1
+            while i < len(lines):
+                block_lines.append(lines[i])
+                if _RE_BACKTICK_LINE.match(lines[i].strip()):
+                    i += 1
+                    break
+                i += 1
+            else:
+                out.extend(block_lines)
+                continue
+
+            inner = block_lines[1:-1]
+            # 检查编造信号词
+            block_text = "\n".join(inner)
+            has_fabrication = any(sig in block_text for sig in _FABRICATION_SIGNALS)
+
+            # 统计有效代码行（排除注释、空行、纯括号行）
+            real_code = sum(
+                1 for ln in inner
+                if ln.strip()
+                and not ln.strip().startswith("//")
+                and not ln.strip().startswith("#")
+                and ln.strip() not in ("{", "}", "};", ");", "});", "};};")
+            )
+
+            if has_fabrication or real_code < 2:
+                continue
+            out.extend(block_lines)
+        else:
+            out.append(line)
+            i += 1
+    return out
+
+
+# ─── 时长计算 ─────────────────────────────────────────────────────────────────
+def _duration_sum(segs: List[Dict]) -> str:
+    total = sum(
+        int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        for s in segs
+        if (m := _RE_DURATION.match(s["duration"]))
+    )
+    return str(datetime.timedelta(seconds=total)) if total else "未知"
+
+
+# ─── 核心生成 ─────────────────────────────────────────────────────────────────
 def generate_for_prefix(
     client: Groq,
     prefix: str,
-    prompt_text: str,
     *,
     force: bool = False,
 ) -> bool:
-    """为指定前缀的课程生成一个合并笔记文件
-
-    策略：逐段调用 LLM（每段输出 MINDMAP / DATATABLE / DETAIL 块）
-         → 解析各段内容 → 组装成统一的 Mind Map + Data Table + 各段详情
-    """
     NOTES_DIR.mkdir(exist_ok=True)
     out_file = NOTES_DIR / f"{prefix}.md"
-
     if out_file.exists() and not force:
         print(f"⏭️  已跳过: {prefix}（笔记已存在，使用 --force 覆盖）", flush=True)
         return False
 
     segments = collect_segments(prefix)
     if not segments:
-        print(f"❌ 跳过: {prefix}（未找到已转录的视频段）", flush=True)
+        print(f"❌ 跳过: {prefix}（未找到已转录视频段）", flush=True)
         return False
 
-    total_lines  = sum(s["srt_lines"] for s in segments)
+    total_lines = sum(s["srt_lines"] for s in segments)
     total_frames = sum(s["frame_count"] for s in segments)
-    total_secs   = 0
-    for s in segments:
-        m = re.match(r"(\d+):(\d+):(\d+)", s["duration"])
-        if m:
-            total_secs += int(m.group(1))*3600 + int(m.group(2))*60 + int(m.group(3))
-    total_dur = str(datetime.timedelta(seconds=total_secs)) if total_secs else "未知"
+    total_dur = _duration_sum(segments)
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     print(f"\n📚 开始生成课程笔记: {prefix}", flush=True)
     print(f"   {len(segments)} 个视频段 | 总时长 {total_dur} | {total_lines:,} 行转录 | {total_frames:,} 帧", flush=True)
 
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    # ── 逐段调用 LLM，收集解析结果 ──
-    all_mindmap:   List[str] = []
+    all_mindmap: List[str] = []
     all_datatable: List[str] = []
-    all_detail:    List[str] = []
+    all_detail: List[str] = []
 
     for i, seg in enumerate(segments, 1):
         seg_short = seg["folder"].replace(prefix + "_", "")
         print(f"   [{i}/{len(segments)}] 生成章节: {seg_short}", flush=True)
-        prompt = _build_segment_prompt(seg, prompt_text, i, len(segments))
+        prompt = _build_segment_prompt(seg, i, len(segments))
         try:
             raw = call_llm(client, prompt)
             blocks = _parse_blocks(raw)
         except Exception as e:
             print(f"   ❌ 章节生成失败: {e}", flush=True)
             blocks = {
-                "mindmap":   f"- ⚠️ {seg_short}（生成失败：{e}）",
-                "datatable": f"| {seg['folder']} | — | 生成失败 | — | — | — |",
-                "detail":    f"> ⚠️ 本章节生成失败：{e}",
+                "mindmap": "- ⚠️ 生成失败，待重试验证。",
+                "datatable": f"| {seg_short} | — | 生成失败 | — | — | — |",
+                "detail": "- **核心大纲**：本段生成失败，待重试。\n- **关键数据与术语**：待转录验证。\n- **详细解析**：未生成。",
             }
 
-        # 每段作为 markmap 的一级分支（## 标题），其内容降一级（## → ###, ### → ####）
-        all_mindmap.append(f"## {seg_short}")
+        all_mindmap.append(f"- **{seg_short}**")
         for line in blocks["mindmap"].splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                # 已有标题层级：整体降一级（## → ###）
-                all_mindmap.append("#" + line.lstrip("#").rstrip() if stripped.startswith("##") else line)
-            elif stripped:
-                # 非标题行（意外输出的列表等）：作为三级节点
-                all_mindmap.append(f"### {stripped.lstrip('- ').lstrip('* ')}")
+            if line.strip():
+                all_mindmap.append("  " + line)
         all_mindmap.append("")
 
-        all_datatable.extend(
-            line for line in blocks["datatable"].splitlines()
-            if line.strip().startswith("|")
-        )
+        all_datatable.extend(r.strip() for r in blocks["datatable"].splitlines() if r.strip().startswith("|"))
 
-        all_detail.append(f"\n### 补充说明：{seg_short}\n\n{blocks['detail']}\n")
+        all_detail.append(f"\n### 3.{i} {seg_short}\n\n{blocks['detail']}\n")
 
         if i < len(segments):
             time.sleep(NOTE_SEGMENT_SLEEP)
 
-    # ── 组装最终笔记 ──
+    # ── 组装笔记 ──
     table_header = (
         "| 视频段 | 时间戳节点 | 主题/章节 | 关键术语/数据/对比 | "
         "证据来源（转录/关键帧） | 可执行结论 |\n"
-        "|--------|-----------|---------|------------------|---------------------|--------|"
+        "| :--- | :--- | :--- | :--- | :--- | :--- |"
     )
-    datatable_body = "\n".join(all_datatable) if all_datatable else "| — | — | — | — | — | — |"
+    markmap_block = _list_to_markmap(all_mindmap, prefix)
 
-    parts = [
+    buf: List[str] = [
         "---",
         f"title: {prefix}",
         f"created: {now}",
@@ -369,186 +580,109 @@ def generate_for_prefix(
         "",
     ]
     for seg in segments:
-        seg_short = seg["folder"].replace(prefix + "_", "")
-        parts.append(
-            f"- **{seg_short}**：时长 {seg['duration']}，"
-            f"{seg['srt_lines']:,} 行转录，{seg['frame_count']:,} 张关键帧"
-        )
-    # markmap 代码块：根节点为课程名，各段为一级分支
-    markmap_body = "\n".join(all_mindmap).strip()
-    parts += [
+        s = seg["folder"].replace(prefix + "_", "")
+        buf.append(f"- **{s}**：时长 {seg['duration']}，{seg['srt_lines']:,} 行转录，{seg['frame_count']:,} 张关键帧")
+
+    buf += [
         "",
         "---",
         "",
         "## 1. 结构化思维导图 (Mind Map)",
         "",
-        "> 需要 Obsidian 插件 [Mindmap NextGen](obsidian://show-plugin?id=mindmap-nextgen) 或 [Render Block Markmap](obsidian://show-plugin?id=obsidian-render-block-markmap) 以渲染交互式思维导图。",
+        "> 使用 Obsidian 插件 [Mindmap NextGen](obsidian://show-plugin?id=mindmap-nextgen) 可渲染为交互式思维导图。",
         "",
         "```markmap",
-        f"# {prefix}",
-        markmap_body,
+        markmap_block,
         "```",
-    ]
-    parts += [
         "",
         "---",
         "",
         "## 2. 综合数据表格 (Data Table)",
         "",
         table_header,
-        datatable_body,
+        "\n".join(all_datatable) if all_datatable else "| — | — | — | — | — | — |",
         "",
         "---",
         "",
-        "## 3. 各段详情",
+        "## 3. 各段详情 (Segment Details)",
     ]
-    parts.extend(all_detail)
+    buf.extend(all_detail)
 
-    full_content = "\n".join(parts)
-    out_file.write_text(full_content, encoding="utf-8")
-
-    size_kb = round(out_file.stat().st_size / 1024, 1)
-    note_lines = full_content.count("\n") + 1
-    print(f"   ✅ 合并笔记已保存：notes/{prefix}.md（{size_kb}KB，{note_lines} 行）", flush=True)
+    content = "\n".join(buf)
+    out_file.write_text(content, encoding="utf-8")
+    print(f"   ✅ 合并笔记已保存：notes/{prefix}.md（{out_file.stat().st_size / 1024:.1f}KB，{content.count(chr(10)) + 1} 行）", flush=True)
     return True
 
 
-# ─── INDEX.md 自动重建 ────────────────────────────────────────────────────────
-
+# ─── INDEX 重建 ───────────────────────────────────────────────────────────────
 def rebuild_index() -> None:
-    """扫描 notes/ 文件夹，完全重建 INDEX.md"""
     NOTES_DIR.mkdir(exist_ok=True)
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    _SKIP = {"INDEX.md", "README.md", "000_我的视频知识大盘.md"}
+    note_files = sorted(f for f in NOTES_DIR.glob("*.md") if f.name not in _SKIP)
 
-    note_files = sorted(
-        f for f in NOTES_DIR.glob("*.md")
-        if f.name not in ("INDEX.md", "README.md")
-    )
-
-    rows: List[Dict] = []
-    for note_file in note_files:
-        prefix = note_file.stem
-        segs   = collect_segments(prefix)
-
-        total_srt    = sum(s["srt_lines"]  for s in segs)
-        total_frames = sum(s["frame_count"] for s in segs)
-        total_secs   = 0
-        for s in segs:
-            m = re.match(r"(\d+):(\d+):(\d+)", s["duration"])
-            if m:
-                total_secs += int(m.group(1))*3600 + int(m.group(2))*60 + int(m.group(3))
-        duration_str = str(datetime.timedelta(seconds=total_secs)) if total_secs else "未知"
-
-        rows.append({
-            "course":    prefix,
-            "file":      prefix,
-            "segments":  str(len(segs)),
-            "duration":  duration_str,
-            "srt_lines": f"{total_srt:,}",
-            "frames":    f"{total_frames:,}",
-        })
-
-    lines = [
-        "---",
-        "title: 📚 课程笔记库",
-        f"updated: {now}",
-        "---",
-        "",
-        "# 📚 视频课程笔记库",
-        "",
-        "> 由 `src/generate_note.py` 自动维护，每次生成笔记后自动更新本文件。",
-        "",
-        "## 课程索引",
-        "",
-        "| 课程名称 | 笔记文件 | 段数 | 时长 | 转录行数 | 关键帧数 |",
-        "|---------|---------|------|------|---------|---------|",
-    ]
-    for r in rows:
-        link = f"[[{r['file']}]]"
-        lines.append(
-            f"| {r['course']} | {link} | {r['segments']} | {r['duration']} "
-            f"| {r['srt_lines']} | {r['frames']} |"
+    rows: List[str] = []
+    for nf in note_files:
+        segs = collect_segments(nf.stem)
+        rows.append(
+            f"| {nf.stem} | [[{nf.name}]] | {len(segs)} | "
+            f"{_duration_sum(segs)} | {sum(s['srt_lines'] for s in segs):,} | {sum(s['frame_count'] for s in segs):,} |"
         )
 
-    total_seg     = sum(int(r["segments"]) for r in rows)
-    total_srt_raw = sum(int(r["srt_lines"].replace(",", "")) for r in rows)
-    total_fr_raw  = sum(int(r["frames"].replace(",", "")) for r in rows)
-
-    lines += [
-        f"| **合计** | **{len(rows)} 门课程** | **{total_seg}** | — "
-        f"| **{total_srt_raw:,}** | **{total_fr_raw:,}** |",
+    lines = [
+        "# 课程笔记索引",
         "",
-        "---",
+        f"> 更新时间：{now}",
+        f"> 课程数量：{len(rows)}",
         "",
-        "## 快速命令",
-        "",
-        "```bash",
-        "# 生成指定课程笔记（合并所有视频段）",
-        '.venv/bin/python src/generate_note.py --prefix "00_14_第十四课：深入合约创建"',
-        "",
-        "# 批量生成所有课程笔记（跳过已有）",
-        ".venv/bin/python src/generate_note.py --all",
-        "",
-        "# 强制重新生成",
-        ".venv/bin/python src/generate_note.py --all --force",
-        "",
-        "# 仅重建 INDEX",
-        ".venv/bin/python src/generate_note.py --update-index",
-        "```",
-        "",
-        f"---",
-        f"*最后更新：{now}*",
+        "| 课程 | 文件 | 段数 | 总时长 | 转录行数 | 关键帧数 |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        *rows,
     ]
-
-    INDEX_FILE.write_text("\n".join(lines), encoding="utf-8")
+    INDEX_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"✅ INDEX.md 已更新（{len(rows)} 门课程）", flush=True)
 
 
-# ─── 入口 ─────────────────────────────────────────────────────────────────────
-
-def main() -> None:
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+def main() -> int:
     load_dotenv()
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        print("❌ 未检测到 GROQ_API_KEY，请在 .env 中设置。")
-        sys.exit(1)
-    if not PROMPT_FILE.exists():
-        print(f"❌ 未找到提示词文件：{PROMPT_FILE}")
-        sys.exit(1)
+    p = argparse.ArgumentParser(description="根据转录自动生成课程笔记并更新索引")
+    p.add_argument("--prefix", type=str, default=None)
+    p.add_argument("--all", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--update-index", action="store_true")
+    args = p.parse_args()
 
-    parser = argparse.ArgumentParser(
-        description="为视频转录生成 NotebookLM 风格笔记（同一课程的多视频段合并为一份笔记）"
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--prefix", "-p",
-                       help="课程前缀，例如 '00_14_第十四课：深入合约创建'")
-    group.add_argument("--all", "-a", action="store_true",
-                       help="批量生成所有课程笔记（跳过已有）")
-    group.add_argument("--update-index", action="store_true",
-                       help="仅重建 INDEX.md，不生成笔记")
-    parser.add_argument("--force", "-f", action="store_true",
-                        help="强制重新生成已有笔记")
-    args = parser.parse_args()
-
-    prompt_text = PROMPT_FILE.read_text(encoding="utf-8")
-    client      = Groq(api_key=api_key, timeout=300.0)
-
-    if args.update_index:
+    if args.update_index and not args.all and not args.prefix:
+        print("🔄 正在更新 notes/INDEX.md ...", flush=True)
         rebuild_index()
-        return
+        return 0
 
-    prefixes = [args.prefix] if args.prefix else discover_all_prefixes()
-    print(f"🔍 共 {len(prefixes)} 个课程前缀：{prefixes}", flush=True)
+    if not args.all and not args.prefix:
+        print("请提供 --all 或 --prefix", flush=True)
+        return 2
 
-    generated = 0
-    for prefix in prefixes:
-        if generate_for_prefix(client, prefix, prompt_text, force=args.force):
-            generated += 1
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        print("❌ 未检测到 GROQ_API_KEY，请先在 .env 中配置", flush=True)
+        return 2
+    if not OUTPUT_MEDIA.exists():
+        print(f"❌ 输出目录不存在：{OUTPUT_MEDIA}", flush=True)
+        return 2
+
+    client = Groq(api_key=api_key)
+    prefixes = discover_prefixes() if args.all else ([args.prefix] if args.prefix else [])
+
+    if args.all:
+        print(f"🔍 共 {len(prefixes)} 个课程前缀：{prefixes}", flush=True)
+
+    generated = sum(1 for pf in prefixes if generate_for_prefix(client, pf, force=args.force))
 
     print("\n🔄 正在更新 notes/INDEX.md ...", flush=True)
     rebuild_index()
     print(f"\n✅ 完成！本次新生成 {generated} 篇课程笔记。", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

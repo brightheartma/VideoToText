@@ -1,4 +1,6 @@
 import os
+import re
+import shutil
 import datetime
 import subprocess
 import time
@@ -316,6 +318,37 @@ def batch_transcribe_with_api(base_dir):
             print(f"  -> ❌ 失败: API 请求出错 ({e})", flush=True)
             stats["failed"] += 1
     
+    # 聚合 SRT 文件，按课程前缀分类到 data/srt_exports/
+    srt_exports_dir = os.path.join(base_dir, "data", "srt_exports")
+    os.makedirs(srt_exports_dir, exist_ok=True)
+
+    print("\n📦 正在将分散的 SRT 文件按课程聚合导出...", flush=True)
+    exported_count = 0
+    for folder in folders:
+        folder_path = os.path.join(output_dir, folder)
+        if not os.path.isdir(folder_path):
+            continue
+        srt_path = os.path.join(folder_path, "transcript", "audio.srt")
+        if not os.path.exists(srt_path):
+            continue
+
+        matches = list(re.finditer(r"_\d{2}_", folder))
+        if matches:
+            split_idx = matches[-1].start()
+            prefix = folder[:split_idx]
+            segment_name = folder[split_idx + 1:]
+        else:
+            prefix = "未分类课程"
+            segment_name = folder
+
+        target_course_dir = os.path.join(srt_exports_dir, prefix)
+        os.makedirs(target_course_dir, exist_ok=True)
+        target_srt_path = os.path.join(target_course_dir, f"{segment_name}.srt")
+        shutil.copy2(srt_path, target_srt_path)
+        exported_count += 1
+
+    print(f"  -> ✅ 成功聚合 {exported_count} 个转录文件至: data/srt_exports/", flush=True)
+
     # 打印总结
     print("=" * 70, flush=True)
     print(f"\n📈 转录总结:", flush=True)
@@ -361,6 +394,7 @@ def print_usage():
    - 输入：data/output/<视频名>/audio.mp3
    - 输出：data/output/<视频名>/transcript/audio.srt
           data/output/<视频名>/transcript/transcript.md
+          data/srt_exports/<课程前缀>/<段落名>.srt  （聚合副本，供 @引用）
 
 """)
 
